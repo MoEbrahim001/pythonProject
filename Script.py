@@ -1,87 +1,169 @@
 import os
 import logging
 import threading
-import pyodbc
+import pickle
+from uuid import uuid4
+
 import cv2
 import face_recognition
-import pickle
+import pyodbc
+from flask import Flask, jsonify, request
 from sklearn.neighbors import NearestNeighbors
-from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
-from flask_cors import CORS
 
 
-# ---------------- Logging ----------------
-logging.basicConfig(level=logging.INFO)
+# =========================================================
+# Logging
+# =========================================================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
-# ---------------- Flask ----------------
+# =========================================================
+# Flask
+# =========================================================
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:4200"}})
 
 
-# ---------------- Configuration ----------------
-IMAGE_FOLDER = r"D:\Face-Recognition\PatientSystem.WebApi\images"
-ENCODING_FOLDER = r"D:\Face-Recognition\PatientSystem.WebApi\EncodingFile"
-UPLOAD_FOLDER = r"D:\Face-Recognition\PatientSystem.WebApi\uploads"
-BASE_URL = "http://localhost:5000"
+# =========================================================
+# Configuration
+# =========================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-DATABASE_CONFIG = {
-    "DRIVER": "{SQL Server}",
-    "SERVER": r"DESKTOP-CLQGA5Q\SQLEXPRESS",
-    "DATABASE": "PatientSystemDB",
-    "Trusted_Connection": "yes",
-}
+DATA_FOLDER = os.getenv(
+    "DATA_FOLDER",
+    os.path.join(BASE_DIR, "data"),
+)
 
+ENCODING_FOLDER = os.getenv(
+    "ENCODING_FOLDER",
+    os.path.join(DATA_FOLDER, "encodings"),
+)
 
-# Ensure directories exist
-os.makedirs(IMAGE_FOLDER, exist_ok=True)
+UPLOAD_FOLDER = os.getenv(
+    "UPLOAD_FOLDER",
+    os.path.join(DATA_FOLDER, "uploads"),
+)
+
+# This should point to the PUBLIC .NET images endpoint.
+# Local example: https://localhost:7183/images
+# Production example: https://your-dotnet-api.example.com/images
+PUBLIC_IMAGE_BASE_URL = os.getenv(
+    "PUBLIC_IMAGE_BASE_URL",
+    "https://localhost:7183/images",
+).rstrip("/")
+
+DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
+
+# Local Windows fallback only.
+LOCAL_DB_DRIVER = os.getenv("LOCAL_DB_DRIVER", "{SQL Server}")
+LOCAL_DB_SERVER = os.getenv(
+    "LOCAL_DB_SERVER",
+    r"DESKTOP-CLQGA5Q\SQLEXPRESS",
+)
+LOCAL_DB_NAME = os.getenv(
+    "LOCAL_DB_NAME",
+    "PatientSystemDB",
+)
+
+MATCH_TOLERANCE = float(
+    os.getenv("MATCH_TOLERANCE", "0.5")
+)
+
+PORT = int(os.getenv("PORT", "5000"))
+
 os.makedirs(ENCODING_FOLDER, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
+# =========================================================
+# Helpers
+# =========================================================
+def get_filename_from_path(value):
+    if not value:
+        return None
+
+    normalized = str(value).replace("\\", "/")
+    return normalized.rstrip("/").split("/")[-1]
+
+
+def build_face_image_url(face_img):
+    if not face_img:
+        return None
+
+    face_img_text = str(face_img).strip()
+
+    if face_img_text.startswith(("http://", "https://")):
+        return face_img_text
+
+    filename = get_filename_from_path(face_img_text)
+    if not filename:
+        return None
+
+    return f"{PUBLIC_IMAGE_BASE_URL}/{filename}"
+
+
+def allowed_image_filename(filename):
+    if not filename or "." not in filename:
+        return False
+
+    extension = filename.rsplit(".", 1)[1].lower()
+    return extension in {"jpg", "jpeg", "png", "webp", "bmp"}
+
+
+# =========================================================
+# Face Recognition
+# =========================================================
 class SimpleFacerec:
     def __init__(self):
         self.known_face_encodings = []
-        self.known_face_names = []
+        self.known_patient_ids = []
         self.patient_data = {}
         self.knn = None
         self.lock = threading.Lock()
 
     def connect_to_database(self):
-        """Establish a connection to SQL Server."""
         try:
-            return pyodbc.connect(**DATABASE_CONFIG)
-        except Exception as e:
-            logger.error(f"Database connection error: {e}")
+            if DB_CONNECTION_STRING:
+                return pyodbc.connect(
+                    DB_CONNECTION_STRING,
+                    timeout=30,
+                )
+
+            logger.warning(
+                "DB_CONNECTION_STRING is not set. "
+                "Using local SQL Server trusted connection."
+            )
+
+            local_connection_string = (
+                f"DRIVER={LOCAL_DB_DRIVER};"
+                f"SERVER={LOCAL_DB_SERVER};"
+                f"DATABASE={LOCAL_DB_NAME};"
+                "Trusted_Connection=yes;"
+                "TrustServerCertificate=yes;"
+            )
+
+            return pyodbc.connect(
+                local_connection_string,
+                timeout=30,
+            )
+
+        except Exception as exc:
+            logger.exception("Database connection error: %s", exc)
             return None
 
-    def _clear_loaded_encodings(self):
-        """Clear the currently loaded in-memory recognition data."""
-        with self.lock:
-            self.known_face_encodings = []
-            self.known_face_names = []
-            self.patient_data = {}
-            self.knn = None
-
     def load_encoding_images(self):
-        """
-        Load only patients that are enrolled in face recognition.
-
-        A patient is considered enrolled when EncodingFile in SQL is not NULL/empty.
-        Missing .dat files are skipped silently so demo/internet-image rows do not
-        flood the console with errors.
-        """
         logger.info("Loading face encodings...")
 
         connection = self.connect_to_database()
         if connection is None:
-            return
+            return False
 
         try:
             cursor = connection.cursor()
-
             cursor.execute(
                 """
                 SELECT
@@ -98,56 +180,59 @@ class SimpleFacerec:
             )
 
             patients = cursor.fetchall()
-
             encodings = []
-            names = []
-            patient_metadata = {}
+            patient_ids = []
+            metadata = {}
 
             for patient in patients:
-                patient_id, name, dob, mobile_no, national_no, face_img = patient
+                (
+                    patient_id,
+                    name,
+                    dob,
+                    mobile_no,
+                    national_no,
+                    face_img,
+                ) = patient
 
-                # We intentionally use the configured EncodingFile folder and patient ID.
                 encoding_file_path = os.path.join(
                     ENCODING_FOLDER,
                     f"{patient_id}_encoding.dat",
                 )
 
-                # Do not print an ERROR for old/demo rows whose .dat file does not exist.
                 if not os.path.exists(encoding_file_path):
+                    logger.warning(
+                        "Encoding file missing for patient %s: %s",
+                        patient_id,
+                        encoding_file_path,
+                    )
                     continue
 
                 try:
                     with open(encoding_file_path, "rb") as encoding_file:
                         encoding = pickle.load(encoding_file)
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
-                        f"Could not load encoding for patient ID {patient_id}: {e}"
+                        "Could not load encoding for patient %s: %s",
+                        patient_id,
+                        exc,
                     )
                     continue
 
                 encodings.append(encoding)
-                names.append(name)
-
-                face_img_name = os.path.basename(face_img) if face_img else None
-                face_img_url = (
-                    f"{BASE_URL}/images/{face_img_name}"
-                    if face_img_name
-                    else None
-                )
-
-                # Kept keyed by name because compare_faces returns the stored name.
-                patient_metadata[name] = {
+                patient_ids.append(patient_id)
+                metadata[patient_id] = {
+                    "id": patient_id,
+                    "name": name,
+                    "dob": dob,
                     "mobileno": mobile_no,
                     "nationalno": national_no,
-                    "id": patient_id,
-                    "dob": dob,
-                    "faceImgUrl": face_img_url,
+                    "faceImgUrl": build_face_image_url(face_img),
                 }
 
             with self.lock:
                 self.known_face_encodings = encodings
-                self.known_face_names = names
-                self.patient_data = patient_metadata
+                self.known_patient_ids = patient_ids
+                self.patient_data = metadata
 
                 if encodings:
                     self.knn = NearestNeighbors(
@@ -155,35 +240,34 @@ class SimpleFacerec:
                         algorithm="ball_tree",
                     )
                     self.knn.fit(encodings)
-
-                    logger.info(
-                        f"Loaded {len(self.known_face_encodings)} face encodings."
-                    )
+                    logger.info("Loaded %s face encodings.", len(encodings))
                 else:
                     self.knn = None
                     logger.warning("No face encodings were loaded.")
 
-        except Exception as e:
-            logger.exception(f"Error loading encodings: {e}")
+            return True
+
+        except Exception as exc:
+            logger.exception("Error loading encodings: %s", exc)
+            return False
 
         finally:
             connection.close()
 
-    def compare_faces(self, unknown_image, tolerance=0.5):
-        """Compare an unknown face image with the loaded encodings."""
+    def compare_faces(self, unknown_image, tolerance=MATCH_TOLERANCE):
         try:
             small_image = cv2.resize(unknown_image, (320, 240))
             encodings = face_recognition.face_encodings(small_image)
 
             if not encodings:
-                logger.warning("No face found in the image.")
+                logger.warning("No face found in submitted image.")
                 return None
 
             unknown_encoding = encodings[0]
 
             with self.lock:
                 if self.knn is None:
-                    logger.error("KNN model is not initialized.")
+                    logger.warning("KNN model is not initialized.")
                     return None
 
                 distances, indices = self.knn.kneighbors(
@@ -192,54 +276,32 @@ class SimpleFacerec:
                 )
 
                 distance = float(distances[0][0])
-                logger.info(f"Match distance: {distance}")
+                logger.info("Match distance: %s", distance)
 
                 if distance >= tolerance:
-                    logger.info("No match found within the tolerance threshold.")
                     return None
 
-                return self.known_face_names[indices[0][0]]
+                return self.known_patient_ids[indices[0][0]]
 
-        except Exception as e:
-            logger.exception(f"Error comparing faces: {e}")
+        except Exception as exc:
+            logger.exception("Error comparing faces: %s", exc)
             return None
 
     def generate_encoding_file(self, patient_id, face_image_path):
-        """Generate and save an encoding file for one patient image."""
-        import time
-
-        start_time = time.time()
-
         try:
-            logger.info(f"[Patient {patient_id}] Starting encoding")
-            logger.info(f"[Patient {patient_id}] Image path: {face_image_path}")
-
             if not os.path.exists(face_image_path):
-                logger.error(
-                    f"[Patient {patient_id}] Image not found: {face_image_path}"
-                )
+                logger.error("Image not found: %s", face_image_path)
                 return None
 
-            load_start = time.time()
             face_image = face_recognition.load_image_file(face_image_path)
-
-            logger.info(
-                f"[Patient {patient_id}] Image loaded in "
-                f"{time.time() - load_start:.2f} seconds"
-            )
-
-            encoding_start = time.time()
-            logger.info(f"[Patient {patient_id}] Generating face encoding...")
-
             face_encodings = face_recognition.face_encodings(face_image)
 
-            logger.info(
-                f"[Patient {patient_id}] Face encoding took "
-                f"{time.time() - encoding_start:.2f} seconds"
-            )
-
-            if not face_encodings:
-                logger.error(f"No face found for patient {patient_id}")
+            if len(face_encodings) != 1:
+                logger.error(
+                    "Expected exactly one face for patient %s, found %s.",
+                    patient_id,
+                    len(face_encodings),
+                )
                 return None
 
             encoding_file_path = os.path.join(
@@ -251,290 +313,246 @@ class SimpleFacerec:
                 pickle.dump(face_encodings[0], encoding_file)
 
             logger.info(
-                f"[Patient {patient_id}] Encoding saved to {encoding_file_path}"
-            )
-            logger.info(
-                f"[Patient {patient_id}] TOTAL TIME = "
-                f"{time.time() - start_time:.2f} seconds"
+                "Encoding saved for patient %s to %s",
+                patient_id,
+                encoding_file_path,
             )
 
-            # Do not append directly to KNN here.
-            # SQL is updated by the caller, then /reload_encodings reloads cleanly.
             return encoding_file_path
 
-        except Exception as e:
+        except Exception as exc:
             logger.exception(
-                f"Error generating encoding for patient {patient_id}: {e}"
+                "Error generating encoding for patient %s: %s",
+                patient_id,
+                exc,
             )
             return None
 
 
-# ---------------- Flask routes ----------------
+facerec = SimpleFacerec()
 
-@app.route("/images/<path:filename>")
-def serve_images(filename):
-    return send_from_directory(IMAGE_FOLDER, filename)
+_initialization_lock = threading.Lock()
+_encodings_initialized = False
+
+
+def ensure_encodings_initialized():
+    global _encodings_initialized
+
+    if _encodings_initialized:
+        return
+
+    with _initialization_lock:
+        if _encodings_initialized:
+            return
+
+        _encodings_initialized = facerec.load_encoding_images()
+
+
+@app.before_request
+def initialize_before_request():
+    ensure_encodings_initialized()
+
+
+# =========================================================
+# API Routes
+# =========================================================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "healthy",
+            "loadedEncodings": len(facerec.known_face_encodings),
+        }
+    ), 200
 
 
 @app.route("/detectAndFind", methods=["POST"])
 def detect_and_find():
-    if "file" not in request.files:
+    uploaded_file = request.files.get("file")
+
+    if uploaded_file is None or uploaded_file.filename == "":
         return jsonify(
-            {"status": "error", "message": "No file part"}
+            {
+                "status": "error",
+                "message": "Face image file is required.",
+            }
         ), 400
 
-    file = request.files["file"]
-
-    if file.filename == "":
+    if not allowed_image_filename(uploaded_file.filename):
         return jsonify(
-            {"status": "error", "message": "No selected file"}
+            {
+                "status": "error",
+                "message": "Unsupported image type.",
+            }
         ), 400
 
-    filename = secure_filename(file.filename)
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(file_path)
+    safe_name = secure_filename(uploaded_file.filename)
+    temp_path = os.path.join(
+        UPLOAD_FOLDER,
+        f"{uuid4().hex}_{safe_name}",
+    )
+
+    uploaded_file.save(temp_path)
 
     try:
-        unknown_image = face_recognition.load_image_file(file_path)
-        matched_name = facerec.compare_faces(
-            unknown_image,
-            tolerance=0.5,
-        )
+        unknown_image = face_recognition.load_image_file(temp_path)
+        patient_id = facerec.compare_faces(unknown_image)
 
-        if matched_name is not None:
-            patient_data = facerec.patient_data.get(matched_name)
-
+        if patient_id is None:
             return jsonify(
                 {
                     "status": "success",
-                    "isMatch": True,
-                    "patientName": matched_name,
-                    "patientData": patient_data,
+                    "isMatch": False,
+                    "patientName": "Unknown",
+                    "patientData": {},
                 }
-            )
+            ), 200
+
+        patient_data = facerec.patient_data.get(patient_id, {})
 
         return jsonify(
             {
                 "status": "success",
-                "isMatch": False,
-                "patientName": "Unknown",
-                "patientData": {},
+                "isMatch": True,
+                "patientName": patient_data.get("name"),
+                "patientData": patient_data,
             }
-        )
+        ), 200
 
-    except Exception as e:
-        logger.exception(f"Error in /detectAndFind endpoint: {e}")
-
+    except Exception as exc:
+        logger.exception("Error in /detectAndFind: %s", exc)
         return jsonify(
             {
                 "status": "error",
-                "message": "An error occurred.",
-                "details": str(e),
+                "message": "Face detection failed.",
+                "details": str(exc),
             }
         ), 500
 
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-@app.route("/add_encoding_to_database", methods=["POST"])
-def add_encoding_to_database():
+@app.route("/generate_encoding", methods=["POST"])
+def generate_encoding():
+    patient_id = request.form.get("patientId")
+    uploaded_file = request.files.get("file")
+
+    if not patient_id:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "patientId is required.",
+            }
+        ), 400
+
     try:
-        data = request.get_json(silent=True) or {}
-        logger.info(f"Received data: {data}")
+        patient_id = int(patient_id)
+    except (TypeError, ValueError):
+        return jsonify(
+            {
+                "status": "error",
+                "message": "patientId must be an integer.",
+            }
+        ), 400
 
-        patient_id = data.get("patientId")
-        face_image_path = data.get("faceImage")
+    if uploaded_file is None or uploaded_file.filename == "":
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Face image file is required.",
+            }
+        ), 400
 
-        if not patient_id or not face_image_path:
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "Missing patientId or faceImage path.",
-                }
-            ), 400
+    if not allowed_image_filename(uploaded_file.filename):
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Unsupported image type.",
+            }
+        ), 400
 
-        if not os.path.exists(face_image_path):
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": f"Face image not found at {face_image_path}",
-                }
-            ), 400
+    safe_name = secure_filename(uploaded_file.filename)
+    temp_path = os.path.join(
+        UPLOAD_FOLDER,
+        f"{uuid4().hex}_{safe_name}",
+    )
 
+    uploaded_file.save(temp_path)
+
+    try:
         encoding_file_path = facerec.generate_encoding_file(
             patient_id,
-            face_image_path,
+            temp_path,
         )
 
         if not encoding_file_path:
             return jsonify(
                 {
                     "status": "error",
-                    "message": "Failed to generate encoding file.",
+                    "message": "Exactly one clear face is required.",
                 }
-            ), 500
-
-        connection = facerec.connect_to_database()
-
-        if connection is None:
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "Database connection failed.",
-                }
-            ), 500
-
-        try:
-            cursor = connection.cursor()
-
-            cursor.execute(
-                """
-                UPDATE dbo.Patients
-                SET EncodingFile = ?
-                WHERE Id = ?
-                """,
-                encoding_file_path,
-                patient_id,
-            )
-
-            connection.commit()
-
-            logger.info(
-                f"Database updated for patientId {patient_id} "
-                f"with encoding file path: {encoding_file_path}"
-            )
-
-        except Exception as e:
-            logger.exception(f"Error updating database: {e}")
-
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "Failed to update database.",
-                    "details": str(e),
-                }
-            ), 500
-
-        finally:
-            connection.close()
-
-        # Refresh the in-memory model after SQL has been updated.
-        facerec.load_encoding_images()
+            ), 422
 
         return jsonify(
             {
                 "status": "success",
-                "message": (
-                    "Encoding file generated, database updated, "
-                    "and encodings reloaded successfully."
-                ),
-                "encodingFilePath": encoding_file_path,
+                "encodingFile": os.path.basename(encoding_file_path),
             }
         ), 200
 
-    except Exception as e:
-        logger.exception(f"Error in /add_encoding_to_database endpoint: {e}")
-
+    except Exception as exc:
+        logger.exception("Error in /generate_encoding: %s", exc)
         return jsonify(
             {
                 "status": "error",
-                "message": "An error occurred.",
-                "details": str(e),
+                "message": "Failed to generate encoding.",
+                "details": str(exc),
             }
         ), 500
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 @app.route("/reload_encodings", methods=["GET"])
 def reload_encodings():
-    try:
-        facerec.load_encoding_images()
+    global _encodings_initialized
 
-        return jsonify(
-            {
-                "status": "success",
-                "message": "Encodings reloaded successfully.",
-            }
-        ), 200
+    success = facerec.load_encoding_images()
+    _encodings_initialized = success
 
-    except Exception as e:
-        logger.exception(f"Error during reload: {e}")
-
+    if not success:
         return jsonify(
             {
                 "status": "error",
                 "message": "Failed to reload encodings.",
-                "details": str(e),
             }
         ), 500
 
-
-@app.route("/generate_encoding", methods=["POST"])
-def generate_encoding():
-    data = request.get_json(silent=True) or {}
-
-    patient_id = data.get("patientId")
-    face_image_path = data.get("faceImage")
-
-    if not patient_id or not face_image_path:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Missing patientId or faceImage path.",
-            }
-        ), 400
-
-    if not os.path.exists(face_image_path):
-        return jsonify(
-            {
-                "status": "error",
-                "message": f"Face image not found at {face_image_path}",
-            }
-        ), 400
-
-    encoding_file_path = facerec.generate_encoding_file(
-        patient_id,
-        face_image_path,
-    )
-
-    if encoding_file_path:
-        return jsonify(
-            {
-                "status": "success",
-                "encodingFilePath": encoding_file_path,
-            }
-        ), 200
-
     return jsonify(
         {
-            "status": "error",
-            "message": "Failed to generate encoding.",
+            "status": "success",
+            "message": "Encodings reloaded successfully.",
+            "loadedEncodings": len(facerec.known_face_encodings),
         }
-    ), 500
+    ), 200
 
 
-# ---------------- Startup ----------------
-
-facerec = SimpleFacerec()
-
-
-def load_encodings_on_restart():
-    facerec.load_encoding_images()
-
-
+# =========================================================
+# Local development only
+# In production use Gunicorn, for example:
+# gunicorn --workers 1 --bind 0.0.0.0:5000 Script:app
+# =========================================================
 if __name__ == "__main__":
-    logger.info("Loading existing face encodings...")
-
-    load_encodings_on_restart()
-
-    logger.info("Finished loading face encodings.")
-    logger.info("Starting Flask server...")
+    ensure_encodings_initialized()
 
     app.run(
-        host="127.0.0.1",
-        port=5000,
-        debug=True,
+        host="0.0.0.0",
+        port=PORT,
+        debug=False,
         use_reloader=False,
         threaded=True,
     )
