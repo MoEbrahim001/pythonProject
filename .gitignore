@@ -6,3 +6,5 @@ images/
 .venv/
 venv/
 .env
+data/encodings/*.dat
+data/uploads/

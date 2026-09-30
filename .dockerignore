@@ -1,0 +1,11 @@
+.git
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+data/uploads/*
+images/
+face_encodings.pkl
+known_faces.pkl
+harcascade_frontalface_alt.xml
