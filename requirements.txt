@@ -1,6 +1,10 @@
 Flask
 gunicorn
 opencv-python-headless
-face-recognition
 pyodbc
 scikit-learn
+numpy
+Pillow
+Click
+face-recognition-models==0.3.0
+dlib-bin==20.0.1

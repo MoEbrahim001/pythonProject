@@ -3,21 +3,18 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Native packages required by dlib/face_recognition, OpenCV, pyodbc,
-# and Microsoft ODBC Driver 18 for SQL Server.
+# Runtime libraries only — no C++/CMake build toolchain needed because dlib
+# comes from the prebuilt dlib-bin wheel.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    pkg-config \
     curl \
     gnupg2 \
     ca-certificates \
-    libopenblas-dev \
-    liblapack-dev \
     libgl1 \
     libglib2.0-0 \
+    libgomp1 \
+    libopenblas0-pthread \
+    liblapack3 \
     unixodbc \
-    unixodbc-dev \
     && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
        | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
@@ -29,8 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir --no-deps face-recognition==1.3.0
 
 COPY . .
 
