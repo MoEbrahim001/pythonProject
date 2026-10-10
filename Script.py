@@ -1,5 +1,9 @@
 import time
 _PROCESS_IMPORT_START = time.perf_counter()
+_IMPORT_TIMES = []
+
+# Standard-library imports
+_t = time.perf_counter()
 import os
 import logging
 import threading
@@ -7,12 +11,33 @@ import pickle
 from uuid import uuid4
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
+_IMPORT_TIMES.append(("stdlib", time.perf_counter() - _t))
+
+# Heavy / third-party imports measured individually in the real startup order.
+_t = time.perf_counter()
 import cv2
+_IMPORT_TIMES.append(("cv2", time.perf_counter() - _t))
+
+_t = time.perf_counter()
 import face_recognition
+_IMPORT_TIMES.append(("face_recognition", time.perf_counter() - _t))
+
+_t = time.perf_counter()
 import pyodbc
+_IMPORT_TIMES.append(("pyodbc", time.perf_counter() - _t))
+
+_t = time.perf_counter()
 from flask import Flask, jsonify, request
+_IMPORT_TIMES.append(("flask", time.perf_counter() - _t))
+
+_t = time.perf_counter()
 from sklearn.neighbors import NearestNeighbors
+_IMPORT_TIMES.append(("sklearn.neighbors", time.perf_counter() - _t))
+
+_t = time.perf_counter()
 from werkzeug.utils import secure_filename
+_IMPORT_TIMES.append(("werkzeug", time.perf_counter() - _t))
+
 # =========================================================
 # Logging
 # =========================================================
@@ -21,6 +46,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+for _import_name, _import_seconds in _IMPORT_TIMES:
+    logger.info(
+        "[PERF][IMPORT] %s = %.3f sec",
+        _import_name,
+        _import_seconds,
+    )
+
 logger.info(
     "[PERF][PYTHON] Module imports completed = %.2f sec",
     time.perf_counter() - _PROCESS_IMPORT_START,
