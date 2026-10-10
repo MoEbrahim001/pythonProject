@@ -184,6 +184,79 @@ class SimpleFacerec:
         except Exception as exc:
             logger.exception("Database connection error: %s", exc)
             return None
+    @staticmethod
+    def _serialize_encoding(encoding):
+        return pickle.dumps(
+            encoding,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    @staticmethod
+    def _deserialize_encoding(value):
+        if value is None:
+            return None
+
+        return pickle.loads(bytes(value))
+
+    def save_face_encoding_to_database(self, patient_id, encoding):
+        """Persist one face encoding in SQL Server so it survives Render restarts."""
+        save_start = time.perf_counter()
+        connection = self.connect_to_database()
+
+        if connection is None:
+            logger.error(
+                "Could not save FaceEncoding for patient %s because the database is unavailable.",
+                patient_id,
+            )
+            return False
+
+        try:
+            payload = self._serialize_encoding(encoding)
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE dbo.Patients
+                SET FaceEncoding = ?
+                WHERE Id = ?
+                """,
+                pyodbc.Binary(payload),
+                patient_id,
+            )
+
+            if cursor.rowcount == 0:
+                connection.rollback()
+                logger.error(
+                    "Could not save FaceEncoding because patient %s was not found.",
+                    patient_id,
+                )
+                return False
+
+            connection.commit()
+
+            logger.info(
+                "[PERF][PYTHON] Patient %s FaceEncoding SQL save = %.4f sec | bytes=%s",
+                patient_id,
+                time.perf_counter() - save_start,
+                len(payload),
+            )
+            return True
+
+        except Exception as exc:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
+            logger.exception(
+                "Error saving FaceEncoding for patient %s: %s",
+                patient_id,
+                exc,
+            )
+            return False
+
+        finally:
+            connection.close()
+
     def load_encoding_images(self):
         total_start = time.perf_counter()
         logger.info("[PERF][PYTHON] Loading face encodings START")
@@ -214,10 +287,14 @@ class SimpleFacerec:
                     Dob,
                     Mobileno,
                     Nationalno,
-                    FaceImg
+                    FaceImg,
+                    FaceEncoding
                 FROM dbo.Patients
-                WHERE EncodingFile IS NOT NULL
-                  AND LTRIM(RTRIM(EncodingFile)) <> ''
+                WHERE FaceEncoding IS NOT NULL
+                   OR (
+                        EncodingFile IS NOT NULL
+                        AND LTRIM(RTRIM(EncodingFile)) <> ''
+                      )
                 """
             )
             patients = cursor.fetchall()
@@ -231,6 +308,7 @@ class SimpleFacerec:
             encodings = []
             patient_ids = []
             metadata = {}
+            migrated_to_sql = 0
 
             for patient in patients:
                 (
@@ -240,78 +318,113 @@ class SimpleFacerec:
                     mobile_no,
                     national_no,
                     face_img,
+                    face_encoding_blob,
                 ) = patient
 
-                encoding_file_path = os.path.join(
-                    ENCODING_FOLDER,
-                    f"{patient_id}_encoding.dat",
-                )
+                encoding = None
 
-                if not os.path.exists(encoding_file_path):
-                    rebuild_start = time.perf_counter()
-
-                    logger.warning(
-                        "Encoding file missing for patient %s: %s",
-                        patient_id,
-                        encoding_file_path,
-                    )
-                    logger.info(
-                        "[PERF][PYTHON] Patient %s encoding rebuild START",
-                        patient_id,
-                    )
-
-                    downloaded_image_path = download_patient_image_to_temp(
-                        patient_id,
-                        face_img,
-                    )
-
-                    if downloaded_image_path:
-                        try:
-                            rebuilt_path = self.generate_encoding_file(
-                                patient_id,
-                                downloaded_image_path,
-                            )
-                            if rebuilt_path:
-                                encoding_file_path = rebuilt_path
-                                logger.info(
-                                    "Rebuilt encoding for patient %s.",
-                                    patient_id,
-                                )
-                        finally:
-                            if os.path.exists(downloaded_image_path):
-                                os.remove(downloaded_image_path)
-
-                    logger.info(
-                        "[PERF][PYTHON] Patient %s rebuild TOTAL = %.2f sec",
-                        patient_id,
-                        time.perf_counter() - rebuild_start,
-                    )
-
-                    if not os.path.exists(encoding_file_path):
+                # Fast path: the encoding already lives permanently in SQL.
+                if face_encoding_blob is not None:
+                    sql_blob_start = time.perf_counter()
+                    try:
+                        encoding = self._deserialize_encoding(
+                            face_encoding_blob
+                        )
+                        logger.info(
+                            "[PERF][PYTHON] Patient %s SQL FaceEncoding load = %.4f sec",
+                            patient_id,
+                            time.perf_counter() - sql_blob_start,
+                        )
+                    except Exception as exc:
                         logger.warning(
-                            "Skipping patient %s because its encoding could not be rebuilt.",
+                            "Stored FaceEncoding is invalid for patient %s: %s. Rebuilding once.",
+                            patient_id,
+                            exc,
+                        )
+                        encoding = None
+
+                # Migration / fallback path for old rows that only have EncodingFile.
+                if encoding is None:
+                    migration_start = time.perf_counter()
+                    encoding_file_path = os.path.join(
+                        ENCODING_FOLDER,
+                        f"{patient_id}_encoding.dat",
+                    )
+
+                    # If the current process still has the .dat file, reuse it.
+                    if os.path.exists(encoding_file_path):
+                        try:
+                            load_file_start = time.perf_counter()
+                            with open(encoding_file_path, "rb") as encoding_file:
+                                encoding = pickle.load(encoding_file)
+
+                            logger.info(
+                                "[PERF][PYTHON] Patient %s local .dat load = %.4f sec",
+                                patient_id,
+                                time.perf_counter() - load_file_start,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not load local encoding for patient %s: %s",
+                                patient_id,
+                                exc,
+                            )
+                            encoding = None
+
+                    # On Render cold start the filesystem can be empty, so rebuild once
+                    # from the public patient image and then persist the result in SQL.
+                    if encoding is None:
+                        logger.info(
+                            "[PERF][PYTHON] Patient %s SQL FaceEncoding missing - one-time migration START",
+                            patient_id,
+                        )
+
+                        downloaded_image_path = download_patient_image_to_temp(
+                            patient_id,
+                            face_img,
+                        )
+
+                        if downloaded_image_path:
+                            try:
+                                rebuilt_path = self.generate_encoding_file(
+                                    patient_id,
+                                    downloaded_image_path,
+                                )
+
+                                if rebuilt_path and os.path.exists(rebuilt_path):
+                                    with open(rebuilt_path, "rb") as encoding_file:
+                                        encoding = pickle.load(encoding_file)
+                            finally:
+                                if os.path.exists(downloaded_image_path):
+                                    os.remove(downloaded_image_path)
+
+                    if encoding is None:
+                        logger.warning(
+                            "Skipping patient %s because its face encoding could not be loaded or rebuilt.",
                             patient_id,
                         )
                         continue
 
-                load_file_start = time.perf_counter()
-
-                try:
-                    with open(encoding_file_path, "rb") as encoding_file:
-                        encoding = pickle.load(encoding_file)
-                except Exception as exc:
-                    logger.warning(
-                        "Could not load encoding for patient %s: %s",
+                    # Persist legacy/rebuilt encoding in SQL so this work is never
+                    # repeated on future Render restarts.
+                    payload = self._serialize_encoding(encoding)
+                    cursor.execute(
+                        """
+                        UPDATE dbo.Patients
+                        SET FaceEncoding = ?
+                        WHERE Id = ?
+                        """,
+                        pyodbc.Binary(payload),
                         patient_id,
-                        exc,
                     )
-                    continue
+                    migrated_to_sql += 1
 
-                logger.info(
-                    "[PERF][PYTHON] Patient %s .dat load = %.4f sec",
-                    patient_id,
-                    time.perf_counter() - load_file_start,
-                )
+                    logger.info(
+                        "[PERF][PYTHON] Patient %s one-time SQL migration TOTAL = %.2f sec | bytes=%s",
+                        patient_id,
+                        time.perf_counter() - migration_start,
+                        len(payload),
+                    )
 
                 encodings.append(encoding)
                 patient_ids.append(patient_id)
@@ -324,6 +437,15 @@ class SimpleFacerec:
                     "nationalno": national_no,
                     "faceImgUrl": build_face_image_url(face_img),
                 }
+
+            if migrated_to_sql:
+                migration_commit_start = time.perf_counter()
+                connection.commit()
+                logger.info(
+                    "[PERF][PYTHON] SQL migration commit = %.4f sec | migrated=%s",
+                    time.perf_counter() - migration_commit_start,
+                    migrated_to_sql,
+                )
 
             with self.lock:
                 self.known_face_encodings = encodings
@@ -352,13 +474,19 @@ class SimpleFacerec:
                     logger.warning("No face encodings were loaded.")
 
             logger.info(
-                "[PERF][PYTHON] LOAD ENCODINGS TOTAL = %.2f sec | loaded=%s",
+                "[PERF][PYTHON] LOAD ENCODINGS TOTAL = %.2f sec | loaded=%s | migratedToSql=%s",
                 time.perf_counter() - total_start,
                 len(encodings),
+                migrated_to_sql,
             )
             return True
 
         except Exception as exc:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+
             logger.exception("Error loading encodings: %s", exc)
             logger.info(
                 "[PERF][PYTHON] LOAD ENCODINGS FAILED after %.2f sec",
@@ -368,6 +496,7 @@ class SimpleFacerec:
 
         finally:
             connection.close()
+
     def compare_faces(self, unknown_image, tolerance=MATCH_TOLERANCE):
         total_start = time.perf_counter()
 
@@ -715,6 +844,7 @@ def detect_and_find():
 def generate_encoding():
     patient_id = request.form.get("patientId")
     uploaded_file = request.files.get("file")
+
     if not patient_id:
         return jsonify(
             {
@@ -722,6 +852,7 @@ def generate_encoding():
                 "message": "patientId is required.",
             }
         ), 400
+
     try:
         patient_id = int(patient_id)
     except (TypeError, ValueError):
@@ -731,6 +862,7 @@ def generate_encoding():
                 "message": "patientId must be an integer.",
             }
         ), 400
+
     if uploaded_file is None or uploaded_file.filename == "":
         return jsonify(
             {
@@ -738,6 +870,7 @@ def generate_encoding():
                 "message": "Face image file is required.",
             }
         ), 400
+
     if not allowed_image_filename(uploaded_file.filename):
         return jsonify(
             {
@@ -745,17 +878,20 @@ def generate_encoding():
                 "message": "Unsupported image type.",
             }
         ), 400
+
     safe_name = secure_filename(uploaded_file.filename)
     temp_path = os.path.join(
         UPLOAD_FOLDER,
         f"{uuid4().hex}_{safe_name}",
     )
     uploaded_file.save(temp_path)
+
     try:
         encoding_file_path = facerec.generate_encoding_file(
             patient_id,
             temp_path,
         )
+
         if not encoding_file_path:
             return jsonify(
                 {
@@ -763,12 +899,42 @@ def generate_encoding():
                     "message": "Exactly one clear face is required.",
                 }
             ), 422
+
+        try:
+            with open(encoding_file_path, "rb") as encoding_file:
+                encoding = pickle.load(encoding_file)
+        except Exception as exc:
+            logger.exception(
+                "Could not read generated encoding for patient %s: %s",
+                patient_id,
+                exc,
+            )
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "Generated face encoding could not be read.",
+                }
+            ), 500
+
+        if not facerec.save_face_encoding_to_database(
+            patient_id,
+            encoding,
+        ):
+            return jsonify(
+                {
+                    "status": "error",
+                    "message": "Face encoding was generated but could not be saved to SQL Server.",
+                }
+            ), 500
+
         return jsonify(
             {
                 "status": "success",
                 "encodingFile": os.path.basename(encoding_file_path),
+                "faceEncodingStoredInSql": True,
             }
         ), 200
+
     except Exception as exc:
         logger.exception("Error in /generate_encoding: %s", exc)
         return jsonify(
@@ -778,9 +944,11 @@ def generate_encoding():
                 "details": str(exc),
             }
         ), 500
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
 @app.route("/reload_encodings", methods=["GET"])
 def reload_encodings():
     global _encodings_initialized
